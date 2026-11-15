@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/html"
@@ -20,14 +23,14 @@ type Crawler struct {
 	client       *http.Client
 }
 
-func StartCrawler(startLink string, depth, timeout, workerPool int) {
-	if workerPool == 0 {
-		return
+func StartCrawler(startLink string, depth, timeout, workerPool int) error {
+	if workerPool <= 0 {
+		return nil
 	}
 
 	u, err := url.Parse(startLink)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	q := &Queue{}
@@ -47,39 +50,73 @@ func StartCrawler(startLink string, depth, timeout, workerPool int) {
 
 	var workers sync.WaitGroup
 
-	initWorkers(&crawler, workerPool, &workers)
+	//Контекст отмены по сигналу
+	ctx, cancel := signal.NotifyContext(
+		context.Background(),
+		syscall.SIGINT,
+		syscall.SIGTERM,
+	)
+
+	//Канал для проверки завершения/шатдауна
+	jobDone := make(chan struct{})
+
+	go func() {
+		defer close(jobDone)
+
+		<-ctx.Done()
+		crawler.q.ForceClose()
+	}()
+
+	initWorkers(ctx, &crawler, workerPool, &workers)
 	q.Push(Task{
 		URL:   u,
 		depth: depth,
 	})
 	workers.Wait()
-	crawler.foundLinks.Range(func(key, value any) bool { fmt.Println(key); return true })
+
+	cancel()
+	//Гарантирует завершение управляющей горутины до выхода
+	<-jobDone
+
+	numberOfLinks := 0
+	crawler.foundLinks.Range(func(key, value any) bool {
+		fmt.Println(key)
+		numberOfLinks++
+		return true
+	})
+	fmt.Printf("Links found: %v", numberOfLinks)
+	return nil
 }
 
-func initWorkers(cr *Crawler, amount int, wg *sync.WaitGroup) {
+func initWorkers(ctx context.Context, cr *Crawler, amount int, wg *sync.WaitGroup) {
 	wg.Add(amount)
 	for i := 0; i < amount; i++ {
 		go func() {
-			Worker(cr)
+			Worker(ctx, cr)
 			wg.Done()
 		}()
 	}
 }
 
-func Worker(crawler *Crawler) {
+func Worker(ctx context.Context, crawler *Crawler) {
 	for {
 		task, ok := crawler.q.Pop()
 		if !ok {
 			return
 		}
-		Crawl(crawler, task.URL, task.depth)
+		Crawl(ctx, crawler, task.URL, task.depth)
 	}
 }
 
-func Crawl(cr *Crawler, u *url.URL, depth int) {
+func Crawl(ctx context.Context, cr *Crawler, u *url.URL, depth int) {
 
 	defer cr.q.Done()
-	req, err := http.NewRequest("GET", u.String(), nil)
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"GET",
+		u.String(),
+		nil,
+	)
 	if err != nil {
 		return
 	}
@@ -108,7 +145,15 @@ func Crawl(cr *Crawler, u *url.URL, depth int) {
 
 	links := FindLinks(doc)
 	for _, link := range links {
-		//На случай редиректа основной URL берется из запроса
+
+		//При отмене контекста:
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		//На случай редиректа, основной URL берется из запроса
 		newUrl, err := resp.Request.URL.Parse(link)
 		if err != nil {
 			continue

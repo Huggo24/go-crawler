@@ -22,6 +22,10 @@ func (q *Queue) Push(t Task) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	if q.closed {
+		return
+	}
+
 	q.items = append(q.items, t)
 	q.pending++
 	q.cond.Signal()
@@ -49,8 +53,18 @@ func (q *Queue) Done() {
 	defer q.mu.Unlock()
 
 	q.pending--
-	if q.pending == 0 && len(q.items) == 0 {
+	if q.pending == 0 {
 		q.closed = true
 		q.cond.Broadcast()
 	}
+}
+
+func (q *Queue) ForceClose() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.pending -= len(q.items)
+	q.items = nil
+	q.closed = true
+	q.cond.Broadcast()
 }

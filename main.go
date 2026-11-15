@@ -41,5 +41,8 @@ func main() {
 		}
 	}
 
-	StartCrawler(link, depth, timeout, workerPool)
+	err = StartCrawler(link, depth, timeout, workerPool)
+	if err != nil {
+		fmt.Println(err.Error())
+	}
 }
